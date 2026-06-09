@@ -15,18 +15,32 @@ let municipiosCache = null;
 
 async function getMunicipios() {
   if (municipiosCache) return municipiosCache;
-
-  // 1ª llamada: AEMET devuelve una URL de descarga
-  const r1   = await fetch(`https://opendata.aemet.es/opendata/api/maestro/municipios/?api_key=${AEMET_KEY}`);
-  const j1   = await r1.json();
-  // 2ª llamada: descargamos los datos reales
-  const r2   = await fetch(j1.datos);
+  const r1 = await fetch(`https://opendata.aemet.es/opendata/api/maestro/municipios/?api_key=${AEMET_KEY}`);
+  const j1 = await r1.json();
+  const r2 = await fetch(j1.datos);
   municipiosCache = await r2.json();
   return municipiosCache;
 }
 
 /* ─────────────────────────────────────────
-   Haversine: distancia en km entre dos puntos
+   Caché de predicciones (10 minutos por municipio)
+───────────────────────────────────────── */
+const weatherCache = new Map();
+const CACHE_TTL = 10 * 60 * 1000; // 10 minutos en ms
+
+function getCached(key) {
+  const entry = weatherCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL) { weatherCache.delete(key); return null; }
+  return entry.data;
+}
+
+function setCache(key, data) {
+  weatherCache.set(key, { ts: Date.now(), data });
+}
+
+/* ─────────────────────────────────────────
+   Haversine: distancia en km
 ───────────────────────────────────────── */
 function haversine(lat1, lon1, lat2, lon2) {
   const R  = 6371;
@@ -53,22 +67,20 @@ function municipioCercano(municipios, lat, lon) {
 }
 
 /* ─────────────────────────────────────────
-   Traducción estado_cielo AEMET → WMO aprox.
-   (para reutilizar los iconos del widget)
+   Traducción estado_cielo AEMET → WMO
 ───────────────────────────────────────── */
 function estadoToWMO(valor) {
   const v = parseInt(valor);
-  // https://www.aemet.es/es/eltiempo/prediccion/espana/ayuda
-  if (v === 11 || v === 11n)           return 0;  // Despejado
-  if (v >= 12 && v <= 14)              return 1;  // Poco nublado
-  if (v >= 15 && v <= 16)              return 2;  // Intervalos nubosos
-  if (v === 17 || v === 23 || v === 24) return 3; // Nublado
-  if (v === 43 || v === 44)            return 45; // Niebla
-  if (v >= 51 && v <= 53)              return 61; // Lluvia ligera
-  if (v >= 54 && v <= 56)              return 63; // Lluvia moderada
-  if (v >= 60 && v <= 62)              return 80; // Chubascos
-  if (v >= 71 && v <= 73)              return 71; // Nevada
-  if (v >= 80 && v <= 82)              return 95; // Tormenta
+  if (v === 11)                            return 0;  // Despejado
+  if (v >= 12 && v <= 14)                  return 1;  // Poco nublado
+  if (v >= 15 && v <= 16)                  return 2;  // Intervalos nubosos
+  if (v === 17 || v === 23 || v === 24)    return 3;  // Nublado
+  if (v === 43 || v === 44)                return 45; // Niebla
+  if (v >= 51 && v <= 53)                  return 61; // Lluvia ligera
+  if (v >= 54 && v <= 56)                  return 63; // Lluvia moderada
+  if (v >= 60 && v <= 62)                  return 80; // Chubascos
+  if (v >= 71 && v <= 73)                  return 71; // Nevada
+  if (v >= 80 && v <= 82)                  return 95; // Tormenta
   return 0;
 }
 
@@ -89,9 +101,17 @@ app.get('/weather', async (req, res) => {
     const muni       = municipioCercano(municipios, lat, lon);
     if (!muni) return res.status(500).json({ error: 'No se encontró municipio' });
 
-    const codMunicipio = muni.id.replace('id', ''); // e.g. "id28092" → "28092"
+    const codMunicipio = muni.id.replace('id', '');
 
-    // 2. Predicción diaria del municipio (doble llamada AEMET)
+    // 2. Comprobar caché antes de llamar a AEMET
+    const cached = getCached(codMunicipio);
+    if (cached) {
+      console.log(`[cache] ${muni.nombre} (${codMunicipio})`);
+      return res.json(cached);
+    }
+
+    // 3. Predicción diaria del municipio (doble llamada AEMET)
+    console.log(`[aemet] ${muni.nombre} (${codMunicipio})`);
     const p1  = await fetch(
       `https://opendata.aemet.es/opendata/api/prediccion/especifica/municipio/diaria/${codMunicipio}/?api_key=${AEMET_KEY}`
     );
@@ -106,34 +126,28 @@ app.get('/weather', async (req, res) => {
       return res.status(500).json({ error: 'Sin datos de predicción' });
     }
 
-    // 3. Extraer datos del día de hoy (índice 0) y los 3 siguientes
+    // 4. Extraer datos
     const hoy  = pred[0];
     const hora = new Date().getHours();
 
-    // Temperatura actual: buscamos el periodo horario más cercano
     let tempActual = null;
     if (hoy.temperatura?.dato) {
-      const datos = hoy.temperatura.dato;
-      // Buscar el dato cuya hora sea la más próxima a la actual
       let mejorDiff = Infinity;
-      for (const d of datos) {
+      for (const d of hoy.temperatura.dato) {
         const diff = Math.abs(parseInt(d.hora) - hora);
         if (diff < mejorDiff) { mejorDiff = diff; tempActual = d.value; }
       }
     }
-    // Fallback a media de max+min
     if (tempActual === null) {
       const mx = parseFloat(hoy.temperatura?.maxima);
       const mn = parseFloat(hoy.temperatura?.minima);
-      tempActual = isNaN(mx) || isNaN(mn) ? null : (mx + mn) / 2;
+      tempActual = isNaN(mx) || isNaN(mn) ? null : Math.round((mx + mn) / 2);
     }
 
-    // Estado cielo actual (periodo más cercano a la hora actual)
-    let estadoActual = '11'; // despejado por defecto
+    let estadoActual = '11';
     if (hoy.estadoCielo) {
-      const datos = hoy.estadoCielo;
       let mejorDiff = Infinity;
-      for (const d of datos) {
+      for (const d of hoy.estadoCielo) {
         if (!d.value || d.value === '') continue;
         const diff = Math.abs(parseInt(d.periodo || d.hora || 0) - hora);
         if (diff < mejorDiff) { mejorDiff = diff; estadoActual = d.value; }
@@ -142,12 +156,10 @@ app.get('/weather', async (req, res) => {
 
     const esNoche = hora < 7 || hora >= 21;
 
-    // Previsión 3 días siguientes
     const forecast = [];
     for (let i = 1; i <= 3; i++) {
       const dia = pred[i];
       if (!dia) break;
-      // Estado cielo: tomar el valor del mediodía (periodo 1300 o similar)
       let estado = '11';
       if (dia.estadoCielo && dia.estadoCielo.length > 0) {
         const medio = dia.estadoCielo.find(d => d.periodo === '1218' || d.periodo === '0018');
@@ -160,8 +172,8 @@ app.get('/weather', async (req, res) => {
       });
     }
 
-    // 4. Respuesta limpia
-    res.json({
+    // 5. Construir respuesta y guardar en caché
+    const result = {
       city:    muni.nombre,
       temp:    tempActual,
       tempMax: parseFloat(hoy.temperatura?.maxima) || null,
@@ -169,7 +181,10 @@ app.get('/weather', async (req, res) => {
       code:    estadoToWMO(estadoActual),
       isNight: esNoche,
       forecast,
-    });
+    };
+
+    setCache(codMunicipio, result);
+    res.json(result);
 
   } catch (err) {
     console.error(err);
@@ -180,6 +195,6 @@ app.get('/weather', async (req, res) => {
 /* ─────────────────────────────────────────
    Health check
 ───────────────────────────────────────── */
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'aemet-proxy' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'aemet-proxy', cached: weatherCache.size }));
 
 app.listen(PORT, () => console.log(`aemet-proxy escuchando en puerto ${PORT}`));
